@@ -6,12 +6,12 @@ import os
 import uuid
 import wave
 from datetime import datetime
+from math import gcd
 
 import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 from scipy.signal import resample_poly
-from math import gcd
 
 from agents import Agent
 from agents.voice import (
@@ -23,11 +23,40 @@ from agents.voice import (
     VoicePipelineConfig,
 )
 
-load_dotenv()
-SAMPLE_RATE = 24000
+SAMPLE_RATE = 24_000
 MODEL = "gpt-5.4-mini"
 
-st.set_page_config(page_title="Travel Voice | AI Travel Advisor", page_icon="✈️", layout="wide", initial_sidebar_state="expanded")
+# Must be the first Streamlit UI command.
+st.set_page_config(
+    page_title="Travel Voice | AI Travel Advisor",
+    page_icon="✈️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+def configure_openai_api_key() -> str:
+    """Load local .env or Streamlit Cloud Secrets without exposing the key."""
+    load_dotenv()
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        try:
+            api_key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
+        except (FileNotFoundError, KeyError):
+            api_key = ""
+    if not api_key:
+        st.error(
+            "OPENAI_API_KEY is missing. In Streamlit Community Cloud, "
+            "open your app's Settings → Secrets and add "
+            'OPENAI_API_KEY = "your-key". Then save and reboot the app.'
+        )
+        st.stop()
+    # The Agents SDK reads OPENAI_API_KEY from the environment.
+    os.environ["OPENAI_API_KEY"] = api_key
+    return api_key
+
+
+configure_openai_api_key()
 
 st.markdown("""
 <style>
@@ -64,7 +93,11 @@ hr {border-color:#262a33!important;}
 
 def new_chat():
     chat_id = uuid.uuid4().hex
-    st.session_state.chats[chat_id] = {"title": "New conversation", "created": datetime.now().strftime("%b %d · %I:%M %p"), "messages": []}
+    st.session_state.chats[chat_id] = {
+        "title": "New conversation",
+        "created": datetime.now().strftime("%b %d · %I:%M %p"),
+        "messages": [],
+    }
     st.session_state.active_chat = chat_id
     st.session_state.recorder_version += 1
 
@@ -85,19 +118,22 @@ def init_state():
 def wav_to_pcm(raw_bytes: bytes) -> np.ndarray:
     """Decode browser WAV, downmix mono, resample to 24 kHz int16."""
     from scipy.io import wavfile
+
     rate, audio = wavfile.read(io.BytesIO(raw_bytes))
     if audio.ndim == 2:
         audio = audio.astype(np.float64).mean(axis=1)
     if audio.dtype == np.uint8:
         audio = (audio.astype(np.float64) - 128.0) / 128.0
     elif np.issubdtype(audio.dtype, np.integer):
-        audio = audio.astype(np.float64) / max(abs(np.iinfo(audio.dtype).min), np.iinfo(audio.dtype).max)
+        audio = audio.astype(np.float64) / max(
+            abs(np.iinfo(audio.dtype).min), np.iinfo(audio.dtype).max
+        )
     else:
         audio = audio.astype(np.float64)
     if rate != SAMPLE_RATE:
         factor = gcd(int(rate), SAMPLE_RATE)
         audio = resample_poly(audio, SAMPLE_RATE // factor, int(rate) // factor)
-    return np.clip(audio, -1.0, 1.0) * 32767.0
+    return (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
 
 
 def pcm_to_wav(chunks: list[np.ndarray]) -> bytes:
@@ -121,12 +157,12 @@ class TranscriptCallbacks(SingleAgentWorkflowCallbacks):
 
 async def ask_voice_agent(pcm: np.ndarray, history: list[dict], voice: str):
     callbacks = TranscriptCallbacks()
-    # A new workflow is created for each turn. We pass recent context in its
-    # instructions to make follow-up questions work without cross-chat leakage.
     context = []
     for m in history[-8:]:
         if m.get("transcript") and m.get("answer"):
-            context.append(f"Traveler: {m['transcript'][:500]}\nAdvisor: {m['answer'][:700]}")
+            context.append(
+                f"Traveler: {m['transcript'][:500]}\nAdvisor: {m['answer'][:700]}"
+            )
     context_block = "\n\nRecent conversation context:\n" + "\n".join(context) if context else ""
     agent = Agent(
         name="Travel Advisor",
@@ -153,16 +189,16 @@ async def ask_voice_agent(pcm: np.ndarray, history: list[dict], voice: str):
             if np.issubdtype(chunk.dtype, np.floating):
                 chunk = np.clip(chunk, -1, 1) * 32767
             audio_chunks.append(chunk.astype(np.int16).flatten())
-    return callbacks.transcription.strip(), (result.total_output_text or "").strip(), pcm_to_wav(audio_chunks)
+    return (
+        callbacks.transcription.strip(),
+        (result.total_output_text or "").strip(),
+        pcm_to_wav(audio_chunks),
+    )
 
 
 @st.cache_resource(show_spinner=False)
 def get_voice_event_loop():
-    """One running asyncio loop for async SDK requests across Streamlit reruns.
-
-    Do not close this loop after individual requests. Avoid storing asyncio
-    primitives or AsyncOpenAI clients on a different event loop.
-    """
+    """One running asyncio loop for SDK requests across Streamlit reruns."""
     loop = asyncio.new_event_loop()
     started = threading.Event()
 
@@ -179,23 +215,13 @@ def get_voice_event_loop():
 
 
 def run_voice_request(pcm: np.ndarray, history: list[dict], voice: str):
-    """Run async voice pipeline on the persistent background event loop."""
     loop = get_voice_event_loop()
-    future = asyncio.run_coroutine_threadsafe(
-        ask_voice_agent(pcm, history, voice), loop
-    )
+    future = asyncio.run_coroutine_threadsafe(ask_voice_agent(pcm, history, voice), loop)
     try:
         return future.result(timeout=180)
     except Exception:
         future.cancel()
         raise
-
-
-def secret_api_key() -> str:
-    try:
-        return st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        return ""
 
 
 init_state()
@@ -223,17 +249,11 @@ with st.sidebar:
 
 st.markdown('<div class="topbar"><strong>✦ &nbsp;Travel Advisor</strong><span class="tag">● Voice AI</span></div>', unsafe_allow_html=True)
 
-if not (os.getenv("OPENAI_API_KEY") or secret_api_key()):
-    st.error("OPENAI_API_KEY is missing. Add it to your .env file or Streamlit app secrets, then restart the app.")
-    st.stop()
-if not os.getenv("OPENAI_API_KEY") and secret_api_key():
-    os.environ["OPENAI_API_KEY"] = secret_api_key()
-
 current = st.session_state.chats[st.session_state.active_chat]
 if not current["messages"]:
     st.markdown('''<div class="hero"><div class="orb">✦</div><h1>Where to next?</h1><p>Meet your AI travel companion. Ask about destinations, trip ideas, itineraries, local experiences, and travel tips — just use your voice.</p></div>''', unsafe_allow_html=True)
     st.markdown("**Try asking…**")
-    a,b = st.columns(2)
+    a, b = st.columns(2)
     with a:
         st.markdown('<div class="pill">🌴 Plan a 5-day trip to Bali</div><div class="pill">🗼 What should I see in Paris?</div>', unsafe_allow_html=True)
     with b:
@@ -251,7 +271,12 @@ else:
 
 st.divider()
 st.markdown('<div class="record-title">🎙️ &nbsp;Talk to your travel advisor</div><div class="record-help">Click the microphone, speak naturally, then stop recording to send your message.</div>', unsafe_allow_html=True)
-recording = st.audio_input("Record a voice message", sample_rate=SAMPLE_RATE, key=f"record_{st.session_state.active_chat}_{st.session_state.recorder_version}", label_visibility="collapsed")
+recording = st.audio_input(
+    "Record a voice message",
+    sample_rate=SAMPLE_RATE,
+    key=f"record_{st.session_state.active_chat}_{st.session_state.recorder_version}",
+    label_visibility="collapsed",
+)
 
 if recording is not None:
     data = recording.getvalue()
@@ -259,25 +284,26 @@ if recording is not None:
     if st.session_state.last_audio_token != token:
         if len(data) < 3000:
             st.warning("That recording seems too short. Please try again.")
-        else:
-            if st.button("✦  Send voice message", type="primary", use_container_width=True):
-                if not (os.getenv("OPENAI_API_KEY") or ""):
-                    st.error("API key is missing.")
-                else:
-                    with st.spinner("Listening and preparing your reply…"):
-                        try:
-                            pcm = np.asarray(wav_to_pcm(data), dtype=np.int16)
-                            transcript, answer, reply_wav = run_voice_request(pcm, current["messages"], voice)
-                            current["messages"].append({"transcript": transcript, "answer": answer, "input_wav": data, "reply_wav": reply_wav})
-                            if len(current["messages"]) == 1:
-                                current["title"] = (transcript or "Voice conversation")[:36]
-                            st.session_state.last_audio_token = token
-                            st.session_state.recorder_version += 1
-                            if auto_play and reply_wav:
-                                st.session_state.pending_autoplay = reply_wav
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"Voice request failed: {exc}")
+        elif st.button("✦  Send voice message", type="primary", use_container_width=True):
+            with st.spinner("Listening and preparing your reply…"):
+                try:
+                    pcm = wav_to_pcm(data)
+                    transcript, answer, reply_wav = run_voice_request(pcm, current["messages"], voice)
+                    current["messages"].append({
+                        "transcript": transcript,
+                        "answer": answer,
+                        "input_wav": data,
+                        "reply_wav": reply_wav,
+                    })
+                    if len(current["messages"]) == 1:
+                        current["title"] = (transcript or "Voice conversation")[:36]
+                    st.session_state.last_audio_token = token
+                    st.session_state.recorder_version += 1
+                    if auto_play and reply_wav:
+                        st.session_state.pending_autoplay = reply_wav
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Voice request failed: {exc}")
 
 if st.session_state.get("pending_autoplay"):
     st.audio(st.session_state.pending_autoplay, format="audio/wav", autoplay=True)
